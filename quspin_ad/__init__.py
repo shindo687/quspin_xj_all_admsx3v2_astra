@@ -18,6 +18,7 @@ from .rules import (
     register_upstream_rules,
     differentiable_drive,
     dynamic_trajectory,
+    fixed_grid_trajectory,
     floquet_eigensystem,
 )
 from .rules import ad as _ad
@@ -51,5 +52,6 @@ __all__ = [
     "value_grad_and_hvp",
     "differentiable_drive",
     "dynamic_trajectory",
+    "fixed_grid_trajectory",
     "floquet_eigensystem",
 ]

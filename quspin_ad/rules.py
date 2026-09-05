@@ -769,6 +769,9 @@ def dynamic_trajectory(H: Any, v0: Any, t0: float, times: Any, *, eom: str = "SE
 
 def _dynamic_args_from_call(function: Any, args: tuple[Any, ...], kwargs: dict[str, Any]):
     H = function.__self__
+    # This sidecar-only control chooses retained checkpoints and must not be
+    # forwarded to QuSpin's scipy solver keyword dictionary.
+    kwargs.pop("checkpoint_interval", None)
     if kwargs:
         # Keep the upstream keyword surface but reject iterator/adaptive paths.
         if kwargs.get("iterate", False):
@@ -826,6 +829,14 @@ def dynamic_evolve_vjp(function: Any, wrt: tuple[str, ...], *args: Any, **kwargs
                 result[name] = np.real(np.vdot(g, ds[name]))
         return result
     return value, pullback
+
+
+def fixed_grid_trajectory(H: Any, v0: Any, times: Any, *, t0: float = 0.0,
+                          tangents: Mapping[str, Any] | None = None,
+                          checkpoint_interval: int | None = None, **solver_args: Any):
+    """Convenience spelling for :func:`dynamic_trajectory` with ``t0=0``."""
+    return dynamic_trajectory(H, v0, t0, times, tangents=tangents,
+                              checkpoint_interval=checkpoint_interval, **solver_args)
 
 
 # ---------------------------------------------------------------------------
