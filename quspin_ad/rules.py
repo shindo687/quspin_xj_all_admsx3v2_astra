@@ -809,7 +809,15 @@ def _dynamic_args_from_call(function: Any, args: tuple[Any, ...], kwargs: dict[s
 
 def dynamic_evolve_jvp(function: Any, tangents: Mapping[str, Any], *args: Any, **kwargs: Any):
     H, v0, t0, times, checkpoint_interval, call_kwargs = _dynamic_args_from_call(function, args, kwargs)
-    supported = ("psi0", "v0", "psi", "times", "t0") + tuple(_drive_metadata(H)[1])
+    # The solver's time origin is a fixed-grid boundary.  Shifting it changes
+    # the integration interval and callback sampling convention, so there is
+    # no valid tangent in this rule.  Reject it explicitly instead of
+    # silently returning the zero sensitivity produced by the variational ODE.
+    if "t0" in tangents:
+        raise ad.NonDifferentiablePoint(
+            "dynamic trajectory AD does not support tangents with respect to t0"
+        )
+    supported = ("psi0", "v0", "psi", "times") + tuple(_drive_metadata(H)[1])
     _unsupported(function, tangents, supported)
     directions = {name: value for name, value in tangents.items() if name not in ("v0", "psi0", "psi", "times", "t0")}
     dstate = tangents.get("v0", tangents.get("psi0", tangents.get("psi", ad.ZERO)))
@@ -911,6 +919,19 @@ def _floquet_linear(UF: Any, T: float, dUF: Any, dT: Any, gap_tol: float):
         for j in range(V.shape[1]):
             if i != j:
                 dV[:, i] += V[:, j] * (V[:, j].conj() @ dU @ V[:, i]) / (theta[i] - theta[j])
+    # Match the deterministic phase convention used by floquet_eigensystem.
+    # The eigenproblem determines each vector only up to a complex phase;
+    # without this gauge correction a finite-difference comparison sees an
+    # arbitrary O(1) phase rotation.  Normalize first, then remove the phase
+    # velocity of the pivot component constrained to be real and positive.
+    for i in range(V.shape[1]):
+        vi = V[:, i]
+        raw = dV[:, i]
+        raw = raw - vi * np.real(np.vdot(vi, raw))
+        pivot = int(np.argmax(np.abs(vi)))
+        ratio = raw[pivot] / vi[pivot]
+        raw = raw - 1j * np.imag(ratio) * vi
+        dV[:, i] = raw
     return out, {"EF": dEF, "VF": dV, "thetaF": dtheta}
 
 
@@ -967,6 +988,18 @@ def _canonical(function: Any) -> Any:
 
 def second_jvp(function: Any, /, *args: Any, tangents: Mapping[str, Any], **kwargs: Any):
     fn = _canonical(function)
+    # Second-order composition deliberately covers fixed-shape, pure rules.
+    # These upstream options either mutate caller storage or select a
+    # different (iterator) output contract, so fail before evaluating the
+    # primal to keep boundaries explicit and side-effect free.
+    if fn is ED_state_vs_time and kwargs.get("iterate", False):
+        raise ad.NonDifferentiablePoint(
+            "ED_state_vs_time second-order AD requires iterate=False"
+        )
+    if fn is lin_comb_Q_T and kwargs.get("out", None) is not None:
+        raise ad.NonDifferentiablePoint(
+            "lin_comb_Q_T second-order AD requires out=None"
+        )
     supported = {
         KL_div: ("p1", "p2"),
         coherent_state: ("a",),
@@ -986,6 +1019,12 @@ def second_jvp(function: Any, /, *args: Any, tangents: Mapping[str, Any], **kwar
             d1[name], d2[name] = direction
         else:
             d1[name] = d2[name] = direction
+    if fn is coherent_state:
+        aa = np.asarray(args[0])
+        if aa.ndim != 0 or aa == 0 or not np.all(np.isfinite(aa)):
+            raise ad.NonDifferentiablePoint(
+                "coherent_state second-order AD requires finite non-zero scalar a"
+            )
     value = fn(*args, **kwargs)
     z = lambda name: d1.get(name, ad.ZERO)
     w = lambda name: d2.get(name, ad.ZERO)
