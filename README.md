@@ -46,8 +46,10 @@ has an explicit derivative contract.  Wrap a callback with
 is called as `df_da(t, *callback_args)`, then use `chainrules.jvp` or `vjp` on
 `H.evolve(..., iterate=False)`.  Missing contracts and iterator/adaptive paths
 raise `NonDifferentiablePoint`.  The variational solve stores one tangent
-trajectory per active parameter; `checkpoint_interval` is accepted by
-`dynamic_trajectory` for callers that bound retained checkpoints.
+trajectory per active parameter. With `checkpoint_interval`, integration is
+split into fixed-grid segments of at most that many intervals, so each
+internal `solve_ivp` object retains only one segment; the returned trajectory
+remains full sized.
 
 `quspin_ad.floquet_eigensystem(UF, T)` returns branch-sorted `EF`, normalized
 `VF`, and `thetaF` arrays.  Its JVP/VJP uses the principal logarithm and rejects

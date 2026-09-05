@@ -729,8 +729,9 @@ def _dynamic_sensitivity(H: Any, v0: Any, t0: float, times: Any, directions: Map
         n = state0.size
         def unpack(y):
             return y[:n], {name: y[(i + 1) * n:(i + 2) * n] for i, name in enumerate(names)}
+        initial_names = {"__initial_state__", "v0", "psi0", "psi"}
         y0 = np.concatenate([state0] + [
-            np.asarray(d, dtype=np.complex128) if name == "__initial_state__" and d is not ad.ZERO
+            np.asarray(d, dtype=np.complex128) if name in initial_names and d is not ad.ZERO
             else np.zeros(n, dtype=np.complex128)
             for name, d in directions.items()
         ])
@@ -740,16 +741,40 @@ def _dynamic_sensitivity(H: Any, v0: Any, t0: float, times: Any, directions: Map
             dy = [-1j * mat.dot(state)]
             for name in names:
                 d = tangent[name]
-                drive = (np.zeros_like(state) if name == "__initial_state__" else
+                drive = (np.zeros_like(state) if name.startswith("__") or name in initial_names else
                          dmat[name].dot(state) * (0.0 if directions[name] is ad.ZERO else directions[name]))
                 dy.append(-1j * (mat.dot(d) + drive))
             return np.concatenate(dy)
         opts = {"rtol": solver_args.pop("rtol", 1e-10), "atol": solver_args.pop("atol", 1e-12), "method": solver_name}
-        sol = solve_ivp(rhs, (float(t0), float(t[-1])), y0, t_eval=t, **opts)
-        if not sol.success:
-            raise RuntimeError(sol.message)
-        for i, name in enumerate(names):
-            sens[name] = sol.y[(i + 1) * n:(i + 2) * n, :]
+        # Integrate in checkpoint-sized segments so no solve_ivp object keeps
+        # the entire long grid alive. The full output is still returned by
+        # the function, while each internal solve retains only one segment.
+        if checkpoint_interval is None:
+            segments = [(0, t.size - 1)]
+        else:
+            segments = [(start, min(start + checkpoint_interval, t.size - 1))
+                        for start in range(0, t.size - 1, checkpoint_interval)]
+        current = y0
+        if t.size == 1 and float(t[0]) == float(t0):
+            segments = []
+            for i, name in enumerate(names):
+                sens[name][:, 0] = y0[(i + 1) * n:(i + 2) * n]
+        elif t.size == 1:
+            segments = [(0, 0)]
+        for seg, (start, stop) in enumerate(segments):
+            grid = t[start:stop + 1]
+            span_start = float(t0) if seg == 0 else float(grid[0])
+            sol = solve_ivp(rhs, (span_start, float(grid[-1])), current,
+                            t_eval=grid, **opts)
+            if not sol.success:
+                raise RuntimeError(sol.message)
+            for i, name in enumerate(names):
+                block = sol.y[(i + 1) * n:(i + 2) * n, :]
+                if seg == 0:
+                    sens[name][:, start:stop + 1] = block
+                else:
+                    sens[name][:, start + 1:stop + 1] = block[:, 1:]
+            current = sol.y[:, -1]
     except ImportError:  # pragma: no cover - scipy is a QuSpin dependency
         raise RuntimeError("dynamic trajectory AD requires scipy.integrate.solve_ivp")
     return value, sens
@@ -771,7 +796,7 @@ def _dynamic_args_from_call(function: Any, args: tuple[Any, ...], kwargs: dict[s
     H = function.__self__
     # This sidecar-only control chooses retained checkpoints and must not be
     # forwarded to QuSpin's scipy solver keyword dictionary.
-    kwargs.pop("checkpoint_interval", None)
+    checkpoint_interval = kwargs.pop("checkpoint_interval", None)
     if kwargs:
         # Keep the upstream keyword surface but reject iterator/adaptive paths.
         if kwargs.get("iterate", False):
@@ -779,31 +804,32 @@ def _dynamic_args_from_call(function: Any, args: tuple[Any, ...], kwargs: dict[s
     v0 = args[0] if args else kwargs.pop("v0")
     t0 = args[1] if len(args) > 1 else kwargs.pop("t0")
     times = args[2] if len(args) > 2 else kwargs.pop("times")
-    return H, v0, t0, times, kwargs
+    return H, v0, t0, times, checkpoint_interval, kwargs
 
 
 def dynamic_evolve_jvp(function: Any, tangents: Mapping[str, Any], *args: Any, **kwargs: Any):
-    H, v0, t0, times, call_kwargs = _dynamic_args_from_call(function, args, kwargs)
+    H, v0, t0, times, checkpoint_interval, call_kwargs = _dynamic_args_from_call(function, args, kwargs)
     supported = ("psi0", "v0", "psi", "times", "t0") + tuple(_drive_metadata(H)[1])
     _unsupported(function, tangents, supported)
     directions = {name: value for name, value in tangents.items() if name not in ("v0", "psi0", "psi", "times", "t0")}
     dstate = tangents.get("v0", tangents.get("psi0", tangents.get("psi", ad.ZERO)))
     if dstate is not ad.ZERO:
         directions["__initial_state__"] = dstate
+    if "times" in tangents:
+        raise ad.NonDifferentiablePoint("time-grid tangents are not supported; use a fixed grid")
     value = np.asarray(function(*args, **call_kwargs))
     integration_kwargs = dict(call_kwargs); integration_kwargs.pop("eom", None); integration_kwargs.pop("iterate", None)
-    _, ds = _dynamic_sensitivity(H, v0, t0, times, directions, eom=call_kwargs.get("eom", "SE"), **integration_kwargs)
+    _, ds = _dynamic_sensitivity(H, v0, t0, times, directions, eom=call_kwargs.get("eom", "SE"),
+                                 checkpoint_interval=checkpoint_interval, **integration_kwargs)
     tangent = np.zeros_like(value, dtype=np.complex128)
     if "__initial_state__" in ds:
         tangent += ds.pop("__initial_state__")
-    if "times" in tangents:
-        raise ad.NonDifferentiablePoint("time-grid tangents are not supported; use a fixed grid")
     tangent += sum(ds.values(), np.zeros_like(tangent))
     return value, tangent
 
 
 def dynamic_evolve_vjp(function: Any, wrt: tuple[str, ...], *args: Any, **kwargs: Any):
-    H, v0, t0, times, call_kwargs = _dynamic_args_from_call(function, args, kwargs)
+    H, v0, t0, times, checkpoint_interval, call_kwargs = _dynamic_args_from_call(function, args, kwargs)
     supported = ("v0", "psi0", "psi") + tuple(_drive_metadata(H)[1])
     _unsupported(function, wrt, supported)
     value = np.asarray(function(*args, **call_kwargs))
@@ -820,12 +846,21 @@ def dynamic_evolve_vjp(function: Any, wrt: tuple[str, ...], *args: Any, **kwargs
                 for i in np.ndindex(np.asarray(v0).shape):
                     d = np.zeros_like(v0, dtype=np.complex128); d[i] = 1.0
                     integration_kwargs = dict(call_kwargs); integration_kwargs.pop("eom", None); integration_kwargs.pop("iterate", None)
-                    _, ds = _dynamic_sensitivity(H, v0, t0, times, {"__x__": d}, eom=call_kwargs.get("eom", "SE"), **integration_kwargs)
-                    arr[i] = np.real(np.vdot(g, ds["__x__"]))
+                    _, ds = _dynamic_sensitivity(H, v0, t0, times, {"__initial_state__": d}, eom=call_kwargs.get("eom", "SE"),
+                                                 checkpoint_interval=checkpoint_interval, **integration_kwargs)
+                    real_pair = np.real(np.vdot(g, ds["__initial_state__"]))
+                    if np.iscomplexobj(v0):
+                        _, ds_im = _dynamic_sensitivity(H, v0, t0, times, {"__initial_state__": 1j * d},
+                                                        eom=call_kwargs.get("eom", "SE"), checkpoint_interval=checkpoint_interval,
+                                                        **integration_kwargs)
+                        arr[i] = real_pair + 1j * np.real(np.vdot(g, ds_im["__initial_state__"]))
+                    else:
+                        arr[i] = real_pair
                 result[name] = _input_gradient(np.asarray(v0), arr)
             else:
                 integration_kwargs = dict(call_kwargs); integration_kwargs.pop("eom", None); integration_kwargs.pop("iterate", None)
-                _, ds = _dynamic_sensitivity(H, v0, t0, times, {name: 1.0}, eom=call_kwargs.get("eom", "SE"), **integration_kwargs)
+                _, ds = _dynamic_sensitivity(H, v0, t0, times, {name: 1.0}, eom=call_kwargs.get("eom", "SE"),
+                                             checkpoint_interval=checkpoint_interval, **integration_kwargs)
                 result[name] = np.real(np.vdot(g, ds[name]))
         return result
     return value, pullback
@@ -892,17 +927,27 @@ def _floquet_vjp(wrt: tuple[str, ...], UF: Any, T: float, *, gap_tol: float = 1e
     def pullback(cotangent: Any):
         if cotangent is ad.ZERO: return dict.fromkeys(wrt, ad.ZERO)
         if not isinstance(cotangent, Mapping): raise TypeError("Floquet cotangent must map EF, VF, and thetaF outputs")
+        # Omitted output components are zero cotangents.  Materialize
+        # shape-compatible zeros so partial structured pullbacks are valid.
+        cot = {}
+        for key, out_value in out.items():
+            raw = cotangent.get(key, ad.ZERO)
+            cot[key] = np.zeros_like(out_value) if raw is ad.ZERO else _same_shape(raw, out_value, name=f"cotangent[{key}]")
         result = {}
         for name in wrt:
             if name == "T":
                 _, d = _floquet_linear(UF, T, ad.ZERO, 1.0, gap_tol)
-                result[name] = sum(np.real(np.vdot(cotangent.get(k, 0), d[k])) for k in d)
+                result[name] = sum(np.real(np.vdot(cot[k], d[k])) for k in d)
             else:
                 U = _matrix(UF, name="UF"); grad = np.zeros_like(U, dtype=np.complex128)
                 for i in np.ndindex(U.shape):
                     dU = np.zeros_like(U); dU[i] = 1.0
                     _, d = _floquet_linear(U, T, dU, ad.ZERO, gap_tol)
-                    grad[i] = sum(np.real(np.vdot(cotangent.get(k, 0), d[k])) for k in d)
+                    real_pair = sum(np.real(np.vdot(cot[k], d[k])) for k in d)
+                    dU[i] = 1.0j
+                    _, d = _floquet_linear(U, T, dU, ad.ZERO, gap_tol)
+                    imag_pair = sum(np.real(np.vdot(cot[k], d[k])) for k in d)
+                    grad[i] = real_pair + 1.0j * imag_pair
                 result[name] = grad
         return result
     return out, pullback
@@ -922,6 +967,18 @@ def _canonical(function: Any) -> Any:
 
 def second_jvp(function: Any, /, *args: Any, tangents: Mapping[str, Any], **kwargs: Any):
     fn = _canonical(function)
+    supported = {
+        KL_div: ("p1", "p2"),
+        coherent_state: ("a",),
+        commutator: ("H1", "H2"),
+        anti_commutator: ("H1", "H2"),
+        lin_comb_Q_T: ("coeff", "Q_T"),
+        project_op: ("Obs", "proj"),
+        ED_state_vs_time: ("psi", "E", "times"),
+    }.get(fn)
+    if supported is None:
+        raise ad.RuleNotFound(function, "second-order")
+    _unsupported(fn, tangents, supported)
     # A direction may be supplied once (D²f[d,d]) or as a pair (D²f[d1,d2]).
     d1, d2 = {}, {}
     for name, direction in tangents.items():
@@ -968,6 +1025,14 @@ def hessian_vector_product(function: Any, /, *args: Any, wrt: str | Iterable[str
             c_arr = np.asarray(cotangent)
             s_arr = np.asarray(sec)
             pairing = np.real(np.sum(np.conj(c_arr) * s_arr)) if c_arr.ndim == 0 else np.real(np.vdot(c_arr, s_arr))
-            out[i] = pairing
+            if np.iscomplexobj(x):
+                d[name][i] = 1j
+                sec_im = second_jvp(fn, *args, tangents={k: (d[k], mixed[k]) for k in primal}, **kwargs)
+                if isinstance(sec_im, Mapping): sec_im = sec_im.get("Proj_Obs")
+                s_im = np.asarray(sec_im)
+                imag_pair = np.real(np.sum(np.conj(c_arr) * s_im)) if c_arr.ndim == 0 else np.real(np.vdot(c_arr, s_im))
+                out[i] = pairing + 1j * imag_pair
+            else:
+                out[i] = pairing
         result[name]=out
     return result

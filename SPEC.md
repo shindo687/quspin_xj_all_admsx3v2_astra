@@ -107,9 +107,10 @@ iterate=False, tangents={...})` and its VJP integrate the exact variational
 Schrödinger equation on the supplied fixed grid. Active names are callback
 parameter names plus `v0`/`psi0`; adaptive iterators, unsupported callbacks,
 and time-grid tangents fail explicitly. The implementation keeps one tangent
-state per active parameter. `dynamic_trajectory` accepts a
-`checkpoint_interval` marker for reverse-mode callers; retained state is
-bounded by the grid checkpoints and active tangent count.
+state per active parameter. With `checkpoint_interval`, the variational
+integration is split into fixed-grid segments and each internal `solve_ivp`
+object retains at most one checkpoint interval of grid points; the function
+output and its tangents remain full-grid arrays by contract.
 
 ### Floquet eigensystems
 
