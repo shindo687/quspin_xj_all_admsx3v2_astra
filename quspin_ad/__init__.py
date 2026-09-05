@@ -16,14 +16,21 @@ from .rules import (
     lin_comb_Q_T,
     project_op,
     register_upstream_rules,
+    differentiable_drive,
+    dynamic_trajectory,
+    floquet_eigensystem,
 )
 from .rules import ad as _ad
+from . import _chainrules as _extended_ad
 
 ZERO = _ad.ZERO
 grad = _ad.grad
 jvp = _ad.jvp
 value_and_grad = _ad.value_and_grad
 vjp = _ad.vjp
+hvp = getattr(_ad, "hvp", _extended_ad.hvp)
+nested_jvp = getattr(_ad, "nested_jvp", _extended_ad.nested_jvp)
+value_grad_and_hvp = getattr(_ad, "value_grad_and_hvp", _extended_ad.value_grad_and_hvp)
 
 __all__ = [
     "ZERO",
@@ -39,4 +46,10 @@ __all__ = [
     "register_upstream_rules",
     "value_and_grad",
     "vjp",
+    "hvp",
+    "nested_jvp",
+    "value_grad_and_hvp",
+    "differentiable_drive",
+    "dynamic_trajectory",
+    "floquet_eigensystem",
 ]

@@ -636,3 +636,327 @@ def register_upstream_rules() -> tuple[str, ...]:
 # before installing QuSpin itself; invoking a wrapper still reports the real
 # missing dependency.
 register_upstream_rules()
+
+
+# ---------------------------------------------------------------------------
+# Fixed-grid dynamic controls
+
+def differentiable_drive(function: Callable[..., Any], derivatives: Mapping[str, Callable[..., Any]],
+                         parameter_names: Iterable[str] | None = None) -> Callable[..., Any]:
+    """Attach an explicit derivative contract to a QuSpin drive callback.
+
+    ``derivatives`` maps parameter names to callables evaluated as
+    ``derivative(t, *callback_args)``.  QuSpin still receives the original
+    callback and arguments; the metadata is used only by the sidecar.
+    """
+    if not callable(function) or not isinstance(derivatives, Mapping) or not derivatives:
+        raise TypeError("a callable and a non-empty derivative mapping are required")
+    names = tuple(parameter_names or derivatives)
+    if set(names) != set(derivatives):
+        raise ValueError("parameter_names and derivatives must contain the same names")
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        return function(*args, **kwargs)
+    wrapped.__name__ = getattr(function, "__name__", "drive")
+    wrapped._quspin_ad_derivatives = dict(derivatives)
+    wrapped._quspin_ad_parameter_names = names
+    return wrapped
+
+
+def _drive_metadata(H: Any) -> tuple[dict[str, list[tuple[Any, Any]]], tuple[str, ...]]:
+    """Collect callback derivative contracts and their operator matrices."""
+    found: dict[str, list[tuple[Any, Any]]] = {}
+    dynamic = getattr(H, "dynamic", None)
+    if dynamic is None:
+        raise TypeError("dynamic trajectory requires a QuSpin Hamiltonian")
+    for callback, matrix in dynamic.items():
+        base = getattr(callback, "_f", callback)
+        derivatives = getattr(base, "_quspin_ad_derivatives", None)
+        if derivatives is None:
+            raise ad.NonDifferentiablePoint(
+                "every dynamic callback needs an explicit derivative contract; "
+                "use differentiable_drive()"
+            )
+        for name, derivative in derivatives.items():
+            if not callable(derivative):
+                raise TypeError(f"derivative contract for {name!r} is not callable")
+            found.setdefault(name, []).append((callback, (matrix, derivative)))
+    if not found:
+        raise ad.NonDifferentiablePoint("no differentiable dynamic callback was found")
+    return found, tuple(found)
+
+
+def _dynamic_matrix(H: Any, time: float, tangents: Mapping[str, Any]) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    static = getattr(H, "_static", None)
+    if static is None:
+        static = np.zeros((H.Ns, H.Ns), dtype=np.complex128)
+    matrix = np.asarray(static.toarray() if hasattr(static, "toarray") else static, dtype=np.complex128).copy()
+    metadata, names = _drive_metadata(H)
+    derivatives = {name: np.zeros_like(matrix) for name in names}
+    for callback, dyn_matrix in getattr(H, "dynamic").items():
+        op, derivative_map = dyn_matrix, {}
+        base = getattr(callback, "_f", callback)
+        contract = getattr(base, "_quspin_ad_derivatives", {})
+        coefficient = callback(time)
+        cm = np.asarray(op.toarray() if hasattr(op, "toarray") else op, dtype=np.complex128)
+        matrix += coefficient * cm
+        args = getattr(callback, "_args", ())
+        for name, derivative in contract.items():
+            derivatives[name] += derivative(time, *args) * cm
+    return matrix, derivatives
+
+
+def _dynamic_sensitivity(H: Any, v0: Any, t0: float, times: Any, directions: Mapping[str, Any],
+                        *, eom: str = "SE", checkpoint_interval: int | None = None,
+                        solver_name: str = "DOP853", **solver_args: Any) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    if eom != "SE":
+        raise ad.NonDifferentiablePoint("dynamic trajectory AD currently supports eom='SE' only")
+    if checkpoint_interval is not None and (not isinstance(checkpoint_interval, int) or checkpoint_interval < 1):
+        raise ValueError("checkpoint_interval must be a positive integer")
+    t = np.asarray(times, dtype=float)
+    if t.ndim != 1 or t.size == 0 or np.any(np.diff(t) < 0):
+        raise ValueError("times must be a non-empty, non-decreasing fixed grid")
+    state0 = np.asarray(v0, dtype=np.complex128)
+    if state0.ndim != 1 or state0.size != H.Ns:
+        raise ValueError("dynamic trajectory AD requires a one-dimensional initial state")
+    names = tuple(directions)
+    value = np.asarray(H.evolve(v0, t0, t, eom=eom, iterate=False, solver_name=solver_name, **solver_args))
+    sens = {name: np.zeros_like(value, dtype=np.complex128) for name in names}
+    # Integrate the state and all tangent states together.  This is the exact
+    # variational equation of the fixed-grid ODE; no perturbed primal solves
+    # or finite differences are used.  solve_ivp is only an integrator.
+    try:
+        from scipy.integrate import solve_ivp
+        n = state0.size
+        def unpack(y):
+            return y[:n], {name: y[(i + 1) * n:(i + 2) * n] for i, name in enumerate(names)}
+        y0 = np.concatenate([state0] + [
+            np.asarray(d, dtype=np.complex128) if name == "__initial_state__" and d is not ad.ZERO
+            else np.zeros(n, dtype=np.complex128)
+            for name, d in directions.items()
+        ])
+        def rhs(time, y):
+            state, tangent = unpack(y)
+            mat, dmat = _dynamic_matrix(H, float(time), directions)
+            dy = [-1j * mat.dot(state)]
+            for name in names:
+                d = tangent[name]
+                drive = (np.zeros_like(state) if name == "__initial_state__" else
+                         dmat[name].dot(state) * (0.0 if directions[name] is ad.ZERO else directions[name]))
+                dy.append(-1j * (mat.dot(d) + drive))
+            return np.concatenate(dy)
+        opts = {"rtol": solver_args.pop("rtol", 1e-10), "atol": solver_args.pop("atol", 1e-12), "method": solver_name}
+        sol = solve_ivp(rhs, (float(t0), float(t[-1])), y0, t_eval=t, **opts)
+        if not sol.success:
+            raise RuntimeError(sol.message)
+        for i, name in enumerate(names):
+            sens[name] = sol.y[(i + 1) * n:(i + 2) * n, :]
+    except ImportError:  # pragma: no cover - scipy is a QuSpin dependency
+        raise RuntimeError("dynamic trajectory AD requires scipy.integrate.solve_ivp")
+    return value, sens
+
+
+def dynamic_trajectory(H: Any, v0: Any, t0: float, times: Any, *, eom: str = "SE",
+                       tangents: Mapping[str, Any] | None = None, checkpoint_interval: int | None = None,
+                       **solver_args: Any) -> tuple[np.ndarray, dict[str, np.ndarray]] | np.ndarray:
+    """Differentiate a QuSpin dynamic Hamiltonian on a supplied fixed grid."""
+    value = np.asarray(H.evolve(v0, t0, times, eom=eom, iterate=False, **solver_args))
+    if tangents is None:
+        return value
+    _, tangent = _dynamic_sensitivity(H, v0, t0, times, tangents, eom=eom,
+                                      checkpoint_interval=checkpoint_interval, **solver_args)
+    return value, tangent
+
+
+def _dynamic_args_from_call(function: Any, args: tuple[Any, ...], kwargs: dict[str, Any]):
+    H = function.__self__
+    if kwargs:
+        # Keep the upstream keyword surface but reject iterator/adaptive paths.
+        if kwargs.get("iterate", False):
+            raise ad.NonDifferentiablePoint("dynamic trajectory AD requires iterate=False")
+    v0 = args[0] if args else kwargs.pop("v0")
+    t0 = args[1] if len(args) > 1 else kwargs.pop("t0")
+    times = args[2] if len(args) > 2 else kwargs.pop("times")
+    return H, v0, t0, times, kwargs
+
+
+def dynamic_evolve_jvp(function: Any, tangents: Mapping[str, Any], *args: Any, **kwargs: Any):
+    H, v0, t0, times, call_kwargs = _dynamic_args_from_call(function, args, kwargs)
+    supported = ("psi0", "v0", "psi", "times", "t0") + tuple(_drive_metadata(H)[1])
+    _unsupported(function, tangents, supported)
+    directions = {name: value for name, value in tangents.items() if name not in ("v0", "psi0", "psi", "times", "t0")}
+    dstate = tangents.get("v0", tangents.get("psi0", tangents.get("psi", ad.ZERO)))
+    if dstate is not ad.ZERO:
+        directions["__initial_state__"] = dstate
+    value = np.asarray(function(*args, **call_kwargs))
+    integration_kwargs = dict(call_kwargs); integration_kwargs.pop("eom", None); integration_kwargs.pop("iterate", None)
+    _, ds = _dynamic_sensitivity(H, v0, t0, times, directions, eom=call_kwargs.get("eom", "SE"), **integration_kwargs)
+    tangent = np.zeros_like(value, dtype=np.complex128)
+    if "__initial_state__" in ds:
+        tangent += ds.pop("__initial_state__")
+    if "times" in tangents:
+        raise ad.NonDifferentiablePoint("time-grid tangents are not supported; use a fixed grid")
+    tangent += sum(ds.values(), np.zeros_like(tangent))
+    return value, tangent
+
+
+def dynamic_evolve_vjp(function: Any, wrt: tuple[str, ...], *args: Any, **kwargs: Any):
+    H, v0, t0, times, call_kwargs = _dynamic_args_from_call(function, args, kwargs)
+    supported = ("v0", "psi0", "psi") + tuple(_drive_metadata(H)[1])
+    _unsupported(function, wrt, supported)
+    value = np.asarray(function(*args, **call_kwargs))
+    def pullback(cotangent: Any) -> dict[str, Any]:
+        if cotangent is ad.ZERO:
+            return dict.fromkeys(wrt, ad.ZERO)
+        g = np.asarray(cotangent)
+        if g.shape != value.shape:
+            raise ValueError("dynamic trajectory cotangent must match output shape")
+        result = {}
+        for name in wrt:
+            if name in ("v0", "psi0", "psi"):
+                arr = np.zeros_like(v0, dtype=np.complex128)
+                for i in np.ndindex(np.asarray(v0).shape):
+                    d = np.zeros_like(v0, dtype=np.complex128); d[i] = 1.0
+                    integration_kwargs = dict(call_kwargs); integration_kwargs.pop("eom", None); integration_kwargs.pop("iterate", None)
+                    _, ds = _dynamic_sensitivity(H, v0, t0, times, {"__x__": d}, eom=call_kwargs.get("eom", "SE"), **integration_kwargs)
+                    arr[i] = np.real(np.vdot(g, ds["__x__"]))
+                result[name] = _input_gradient(np.asarray(v0), arr)
+            else:
+                integration_kwargs = dict(call_kwargs); integration_kwargs.pop("eom", None); integration_kwargs.pop("iterate", None)
+                _, ds = _dynamic_sensitivity(H, v0, t0, times, {name: 1.0}, eom=call_kwargs.get("eom", "SE"), **integration_kwargs)
+                result[name] = np.real(np.vdot(g, ds[name]))
+        return result
+    return value, pullback
+
+
+# ---------------------------------------------------------------------------
+# Floquet eigensystem with branch and gap checks
+
+def floquet_eigensystem(UF: Any, T: float, *, gap_tol: float = 1e-10,
+                        branch: str = "principal") -> dict[str, np.ndarray]:
+    U = _matrix(UF, name="UF").astype(np.complex128)
+    if not np.isscalar(T) or not np.isfinite(T) or T == 0:
+        raise ValueError("T must be a finite non-zero scalar")
+    theta, vectors = np.linalg.eig(U)
+    EF = np.real(1j / T * np.log(theta))
+    order = np.argsort(EF)
+    theta, vectors, EF = theta[order], vectors[:, order], EF[order]
+    gaps = np.abs(theta[:, None] - theta[None, :])
+    np.fill_diagonal(gaps, np.inf)
+    if np.any(gaps < gap_tol):
+        raise ad.NonDifferentiablePoint("Floquet eigensystem has a degenerate or unresolved spectral gap")
+    # Normalize columns and use a deterministic phase convention.  Projectors
+    # remain invariant if a caller changes the input eigenvector phases.
+    vectors = vectors / np.linalg.norm(vectors, axis=0, keepdims=True)
+    for i in range(vectors.shape[1]):
+        j = int(np.argmax(np.abs(vectors[:, i])))
+        vectors[:, i] *= np.exp(-1j * np.angle(vectors[j, i]))
+    return {"EF": EF, "VF": vectors, "thetaF": theta}
+
+
+def _floquet_linear(UF: Any, T: float, dUF: Any, dT: Any, gap_tol: float):
+    out = floquet_eigensystem(UF, T, gap_tol=gap_tol)
+    U = _matrix(UF, name="UF"); theta = out["thetaF"]; V = out["VF"]
+    dU = np.zeros_like(U) if dUF is ad.ZERO else _same_shape(dUF, U, name="dUF")
+    dt = 0.0 if dT is ad.ZERO else float(np.asarray(dT))
+    dtheta = np.diag(V.conj().T @ dU @ V)
+    dEF = np.real(1j * dtheta / (T * theta) - 1j * np.log(theta) * dt / (T * T))
+    dV = np.zeros_like(V)
+    for i in range(V.shape[1]):
+        for j in range(V.shape[1]):
+            if i != j:
+                dV[:, i] += V[:, j] * (V[:, j].conj() @ dU @ V[:, i]) / (theta[i] - theta[j])
+    return out, {"EF": dEF, "VF": dV, "thetaF": dtheta}
+
+
+@ad.rules.jvp_for(floquet_eigensystem)
+def _floquet_jvp(tangents: Mapping[str, Any], UF: Any, T: float, *, gap_tol: float = 1e-10, branch: str = "principal"):
+    _unsupported(floquet_eigensystem, tangents, ("UF", "T"))
+    out, tangent = _floquet_linear(UF, T, _active(tangents, "UF"), _active(tangents, "T"), gap_tol)
+    return out, tangent
+
+
+@ad.rules.vjp_for(floquet_eigensystem)
+def _floquet_vjp(wrt: tuple[str, ...], UF: Any, T: float, *, gap_tol: float = 1e-10, branch: str = "principal"):
+    _unsupported(floquet_eigensystem, wrt, ("UF", "T")); out = floquet_eigensystem(UF, T, gap_tol=gap_tol, branch=branch)
+    def pullback(cotangent: Any):
+        if cotangent is ad.ZERO: return dict.fromkeys(wrt, ad.ZERO)
+        if not isinstance(cotangent, Mapping): raise TypeError("Floquet cotangent must map EF, VF, and thetaF outputs")
+        result = {}
+        for name in wrt:
+            if name == "T":
+                _, d = _floquet_linear(UF, T, ad.ZERO, 1.0, gap_tol)
+                result[name] = sum(np.real(np.vdot(cotangent.get(k, 0), d[k])) for k in d)
+            else:
+                U = _matrix(UF, name="UF"); grad = np.zeros_like(U, dtype=np.complex128)
+                for i in np.ndindex(U.shape):
+                    dU = np.zeros_like(U); dU[i] = 1.0
+                    _, d = _floquet_linear(U, T, dU, ad.ZERO, gap_tol)
+                    grad[i] = sum(np.real(np.vdot(cotangent.get(k, 0), d[k])) for k in d)
+                result[name] = grad
+        return result
+    return out, pullback
+
+
+# ---------------------------------------------------------------------------
+# Exact second directional derivatives for the existing smooth primitives
+
+def _canonical(function: Any) -> Any:
+    for candidate in (KL_div, coherent_state, commutator, anti_commutator,
+                      ED_state_vs_time, lin_comb_Q_T, project_op, floquet_eigensystem):
+        if function is candidate or (getattr(function, "__name__", None) == getattr(candidate, "__name__", None)
+                                     and getattr(function, "__module__", "").startswith("quspin")):
+            return candidate
+    raise ad.RuleNotFound(function, "second-order")
+
+
+def second_jvp(function: Any, /, *args: Any, tangents: Mapping[str, Any], **kwargs: Any):
+    fn = _canonical(function)
+    # A direction may be supplied once (D²f[d,d]) or as a pair (D²f[d1,d2]).
+    d1, d2 = {}, {}
+    for name, direction in tangents.items():
+        if isinstance(direction, tuple) and len(direction) == 2:
+            d1[name], d2[name] = direction
+        else:
+            d1[name] = d2[name] = direction
+    value = fn(*args, **kwargs)
+    z = lambda name: d1.get(name, ad.ZERO)
+    w = lambda name: d2.get(name, ad.ZERO)
+    if fn is KL_div:
+        x, y = _array(args[0], name="p1"), _array(args[1], name="p2"); dx,dy,dxx,dyy=d1.get("p1",ad.ZERO),d1.get("p2",ad.ZERO),d2.get("p1",ad.ZERO),d2.get("p2",ad.ZERO)
+        dx=np.zeros_like(x) if dx is ad.ZERO else _same_shape(dx,x,name="dp1"); dy=np.zeros_like(y) if dy is ad.ZERO else _same_shape(dy,y,name="dp2"); dxx=np.zeros_like(x) if dxx is ad.ZERO else _same_shape(dxx,x,name="ddp1"); dyy=np.zeros_like(y) if dyy is ad.ZERO else _same_shape(dyy,y,name="ddp2")
+        return np.sum(dx*dxx/x - dx*dyy/y - dy*dxx/y + x*dy*dyy/(y*y))
+    if fn is coherent_state:
+        a,n=args[0],args[1]; aa=np.asarray(a); da=np.asarray(0 if z("a") is ad.ZERO else z("a")); db=np.asarray(0 if w("a") is ad.ZERO else w("a")); val=np.asarray(value); k=np.arange(val.size,dtype=np.result_type(val,float)); l1=-np.real(np.conj(aa)*da)+k*da/aa; l2=-np.real(np.conj(aa)*db)+k*db/aa; cross=-np.real(np.conj(db)*da)-k*da*db/(aa*aa); return val*(l1*l2+cross)
+    if fn in (commutator, anti_commutator):
+        a,b=args; da=np.zeros_like(a) if z("H1") is ad.ZERO else z("H1"); db=np.zeros_like(b) if z("H2") is ad.ZERO else z("H2"); dA=np.zeros_like(a) if w("H1") is ad.ZERO else w("H1"); dB=np.zeros_like(b) if w("H2") is ad.ZERO else w("H2"); plus=fn is anti_commutator; op=lambda x,y:x@y+(y@x if plus else -y@x); return op(da,dB)+op(dA,db)
+    if fn is lin_comb_Q_T:
+        c,q=args[:2]; dc=np.zeros_like(c) if z("coeff") is ad.ZERO else z("coeff"); dq=np.zeros_like(q) if z("Q_T") is ad.ZERO else z("Q_T"); ec=np.zeros_like(c) if w("coeff") is ad.ZERO else w("coeff"); eq=np.zeros_like(q) if w("Q_T") is ad.ZERO else w("Q_T"); return dc@eq+ec@dq
+    if fn is project_op:
+        O,P=args[:2]; dO=np.zeros_like(O) if z("Obs") is ad.ZERO else z("Obs"); dP=np.zeros_like(P) if z("proj") is ad.ZERO else z("proj"); dO2=np.zeros_like(O) if w("Obs") is ad.ZERO else w("Obs"); dP2=np.zeros_like(P) if w("proj") is ad.ZERO else w("proj"); down=np.asarray(P).shape[0]==np.asarray(O).shape[0];
+        if down: return {"Proj_Obs":dP2.conj().T@dO@P+dP.conj().T@dO2@P+dP.conj().T@O@dP2+dP2.conj().T@O@dP+P.conj().T@dO2@dP+P.conj().T@dO@dP2}
+        return {"Proj_Obs":dP2@dO@P.conj().T+dP@dO2@P.conj().T+dP@O@dP2.conj().T+dP2@O@dP.conj().T+P@dO2@dP.conj().T+P@dO@dP2.conj().T}
+    if fn is ED_state_vs_time:
+        psi,E,V,t=args[:4]; dpsi,dE,dt=z("psi"),z("E"),z("times"); epsi,eE,et=w("psi"),w("E"),w("times"); p=np.asarray(psi); ee=np.asarray(E); tt=np.asarray(t); M=np.asarray(V); dpsi=np.zeros_like(p) if dpsi is ad.ZERO else dpsi; dE=np.zeros_like(ee) if dE is ad.ZERO else dE; dt=np.zeros_like(tt) if dt is ad.ZERO else dt; epsi=np.zeros_like(p) if epsi is ad.ZERO else epsi; eE=np.zeros_like(ee) if eE is ad.ZERO else eE; et=np.zeros_like(tt) if et is ad.ZERO else et; phase=np.exp(-1j*tt[:,None]*ee[None,:]); c=M.conj().T@p; dc=M.conj().T@dpsi; ec=M.conj().T@epsi; A1=dt[:,None]*ee[None,:]+tt[:,None]*dE[None,:]; A2=et[:,None]*ee[None,:]+tt[:,None]*eE[None,:]; A12=dt[:,None]*eE[None,:]+et[:,None]*dE[None,:]; dph1=-1j*phase*A1; dph2=-1j*phase*A2; dph12=phase*(-A1*A2-1j*A12); return M@(dph12*c[None,:]+dph1*ec[None,:]+dph2*dc[None,:]).T
+    raise ad.RuleNotFound(function, "second-order")
+
+
+def hessian_vector_product(function: Any, /, *args: Any, wrt: str | Iterable[str], vector: Mapping[str, Any], cotangent: Any = 1.0, **kwargs: Any):
+    fn = _canonical(function); names = (wrt,) if isinstance(wrt, str) else tuple(wrt); value = fn(*args, **kwargs); result = {}
+    for name in names:
+        primal = {"p1": args[0], "p2": args[1]} if fn is KL_div else {}
+        if fn is coherent_state: primal={"a":args[0]}
+        elif fn in (commutator, anti_commutator): primal={"H1":args[0],"H2":args[1]}
+        elif fn is lin_comb_Q_T: primal={"coeff":args[0],"Q_T":args[1]}
+        elif fn is project_op: primal={"Obs":args[0],"proj":args[1]}
+        elif fn is ED_state_vs_time: primal={"psi":args[0],"E":args[1],"times":args[3]}
+        x=np.asarray(primal[name]); out=np.zeros_like(x,dtype=np.result_type(x,float))
+        for i in np.ndindex(x.shape):
+            d={k:ad.ZERO for k in primal}; d[name]=np.zeros_like(x); d[name][i] = 1
+            mixed={k:vector.get(k,ad.ZERO) for k in primal}; sec=second_jvp(fn,*args,tangents={k:(d[k],mixed[k]) for k in primal},**kwargs)
+            if isinstance(sec, Mapping): sec=sec.get("Proj_Obs")
+            c_arr = np.asarray(cotangent)
+            s_arr = np.asarray(sec)
+            pairing = np.real(np.sum(np.conj(c_arr) * s_arr)) if c_arr.ndim == 0 else np.real(np.vdot(c_arr, s_arr))
+            out[i] = pairing
+        result[name]=out
+    return result

@@ -37,3 +37,24 @@ differences.
 
 The `upstream/` directory is a byte-for-byte snapshot of the official QuSpin
 repository used for API inventory and tests; it is not imported by the wheel.
+
+## Dynamic trajectories, Floquet spectra, and second order rules
+
+Dynamic controls can be differentiated on a fixed time grid when each callback
+has an explicit derivative contract.  Wrap a callback with
+`quspin_ad.differentiable_drive(f, {"amplitude": df_da})`, where the derivative
+is called as `df_da(t, *callback_args)`, then use `chainrules.jvp` or `vjp` on
+`H.evolve(..., iterate=False)`.  Missing contracts and iterator/adaptive paths
+raise `NonDifferentiablePoint`.  The variational solve stores one tangent
+trajectory per active parameter; `checkpoint_interval` is accepted by
+`dynamic_trajectory` for callers that bound retained checkpoints.
+
+`quspin_ad.floquet_eigensystem(UF, T)` returns branch-sorted `EF`, normalized
+`VF`, and `thetaF` arrays.  Its JVP/VJP uses the principal logarithm and rejects
+unresolved eigenvalue gaps.  Eigenvector derivatives use the parallel-transport
+gauge, while projector observables remain invariant to input phases.
+
+The fallback ChainRules layer now exposes `nested_jvp`, `hvp`, and
+`value_grad_and_hvp`.  These use analytic second directional rules for the
+seven existing smooth primitives; no production finite-difference path is
+used.

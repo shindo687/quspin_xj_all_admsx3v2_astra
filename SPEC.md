@@ -99,6 +99,34 @@ returns requested `Obs`/`proj` gradients under the real Frobenius inner product.
 `dtype` and orientation are fixed during differentiation.  Central differences
 and JVP/VJP duality are checked to `2e-6`.
 
+### Fixed-grid dynamic Hamiltonian trajectories
+
+`quspin_ad.differentiable_drive(f, derivatives)` attaches an explicit
+derivative contract to a callback. `chainrules.jvp(H.evolve, v0, t0, times,
+iterate=False, tangents={...})` and its VJP integrate the exact variational
+Schrödinger equation on the supplied fixed grid. Active names are callback
+parameter names plus `v0`/`psi0`; adaptive iterators, unsupported callbacks,
+and time-grid tangents fail explicitly. The implementation keeps one tangent
+state per active parameter. `dynamic_trajectory` accepts a
+`checkpoint_interval` marker for reverse-mode callers; retained state is
+bounded by the grid checkpoints and active tangent count.
+
+### Floquet eigensystems
+
+`quspin_ad.floquet_eigensystem(UF, T)` returns principal-branch quasienergies
+(`EF`), normalized eigenvectors (`VF`), and eigenphases (`thetaF`). JVP/VJP
+rules cover `UF` and `T`, use the real-linear complex inner product, fix the
+eigenvector gauge by parallel transport, and reject degenerate or unresolved
+spectral gaps with `NonDifferentiablePoint`.
+
+### Second-order composition
+
+The fallback ChainRules protocol exposes `nested_jvp`, `hvp`, and
+`value_grad_and_hvp`. Their rules are analytic second directional derivatives
+for all seven smooth primitives above, including mixed active-input terms and
+complex real-linear cotangents. Unsupported inputs retain existing boundary
+errors; there is no finite-difference fallback.
+
 ## Deferred or unsuitable API
 
 The remaining inventory entries are intentionally not registered.  Basis
@@ -107,11 +135,9 @@ operator constructors, predicates, save/load and block construction perform
 object creation or I/O; sparse matvec helpers are backend dispatch; entropy and
 measurement routines contain sorting, rank changes, SVD/eigenvalue branches or
 discrete subsystem choices; `mean_level_spacing` sorts and branches at ties;
-`evolve`, Floquet, Lanczos eigensolvers and exponential operators contain
-adaptive solvers/iterators.
-Hamiltonian/quantum-operator methods (`dot`, `expt_value`, `matrix_ele`) are
-object-bound and their parameter dictionaries and dynamic drives require an
-explicit adapter contract not present in QuSpin's public API.  These entries
+Lanczos eigensolvers and exponential operators contain adaptive
+solvers/iterators. The object-bound Hamiltonian methods (`dot`, `expt_value`,
+`matrix_ele`) remain outside this adapter. These entries
 are marked `deferred` or `not_suitable` with evidence paths in
 `api_inventory.json`; they fail explicitly with ChainRules `RuleNotFound` if
 called through AD.

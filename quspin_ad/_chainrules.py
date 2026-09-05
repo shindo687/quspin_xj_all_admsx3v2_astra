@@ -121,10 +121,32 @@ def jvp(function, /, *args, tangents, **kwargs):
     if not isinstance(tangents, Mapping):
         raise TypeError("tangents must be a mapping from parameter names to values")
     signature = _signature_bind(function, args, kwargs)
-    _names(tuple(tangents), signature, "tangent")
+    try:
+        _names(tuple(tangents), signature, "tangent")
+    except TypeError:
+        if not (getattr(function, "__name__", None) == "evolve" and getattr(function, "__self__", None) is not None):
+            raise
+        from .rules import _drive_metadata
+        allowed = {"v0", "psi0", "psi", "times", "t0"} | set(_drive_metadata(function.__self__)[1])
+        unknown = set(tangents) - allowed
+        if unknown:
+            raise
     if not tangents or all(value is ZERO for value in tangents.values()):
         return function(*args, **kwargs), ZERO
-    result = rules.get_jvp(function)(dict(tangents), *args, **kwargs)
+    try:
+        rule = rules.get_jvp(function)
+    except RuleNotFound:
+        # Bound ``hamiltonian.evolve`` objects are recreated on every attribute
+        # access, so identity based registration cannot describe them.  The
+        # sidecar provides a small protocol hook for this one upstream method.
+        if getattr(function, "__name__", None) == "evolve" and getattr(function, "__self__", None) is not None:
+            from .rules import dynamic_evolve_jvp
+            rule = dynamic_evolve_jvp
+        else:
+            raise
+    result = (rule(function, dict(tangents), *args, **kwargs)
+              if getattr(function, "__name__", None) == "evolve" and getattr(function, "__self__", None) is not None
+              else rule(dict(tangents), *args, **kwargs))
     if not isinstance(result, tuple) or len(result) != 2:
         raise TypeError("A JVP rule must return a two-tuple")
     return result
@@ -132,8 +154,27 @@ def jvp(function, /, *args, tangents, **kwargs):
 
 def vjp(function, /, *args, wrt, **kwargs):
     signature = _signature_bind(function, args, kwargs)
-    names = _names(wrt, signature, "wrt")
-    result = rules.get_vjp(function)(names, *args, **kwargs)
+    try:
+        names = _names(wrt, signature, "wrt")
+    except TypeError:
+        if not (getattr(function, "__name__", None) == "evolve" and getattr(function, "__self__", None) is not None):
+            raise
+        from .rules import _drive_metadata
+        names = (wrt,) if isinstance(wrt, str) else tuple(wrt)
+        allowed = {"v0", "psi0", "psi"} | set(_drive_metadata(function.__self__)[1])
+        if set(names) - allowed:
+            raise
+    try:
+        rule = rules.get_vjp(function)
+    except RuleNotFound:
+        if getattr(function, "__name__", None) == "evolve" and getattr(function, "__self__", None) is not None:
+            from .rules import dynamic_evolve_vjp
+            rule = dynamic_evolve_vjp
+        else:
+            raise
+    result = (rule(function, names, *args, **kwargs)
+              if getattr(function, "__name__", None) == "evolve" and getattr(function, "__self__", None) is not None
+              else rule(names, *args, **kwargs))
     if not isinstance(result, tuple) or len(result) != 2 or not callable(result[1]):
         raise TypeError("A VJP rule must return (value, pullback)")
     value, raw = result
@@ -161,6 +202,34 @@ def value_and_grad(function, /, *args, wrt, **kwargs):
     if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError("value_and_grad requires a single real scalar output")
     return value, pullback(1.0)
+
+
+def nested_jvp(function, /, *args, tangents, **kwargs):
+    """Evaluate an exact second directional JVP for a registered sidecar map.
+
+    ``tangents`` may contain either one direction (the direction is reused for
+    both slots) or ``(first, second)`` pairs.  The operation is deliberately
+    explicit: unsupported functions raise ``RuleNotFound`` instead of using a
+    numerical-difference approximation.
+    """
+    from .rules import second_jvp
+    return second_jvp(function, *args, tangents=tangents, **kwargs)
+
+
+def hvp(function, /, *args, wrt, vector, cotangent=1.0, **kwargs):
+    """Return a Hessian-vector product for a real scalar sidecar objective."""
+    from .rules import hessian_vector_product
+    return hessian_vector_product(function, *args, wrt=wrt, vector=vector,
+                                  cotangent=cotangent, **kwargs)
+
+
+def value_grad_and_hvp(function, /, *args, wrt, vector, cotangent=1.0, **kwargs):
+    value, pullback = vjp(function, *args, wrt=wrt, **kwargs)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError("value_grad_and_hvp requires a single real scalar output")
+    gradient = pullback(cotangent)
+    return value, gradient, hvp(function, *args, wrt=wrt, vector=vector,
+                                cotangent=cotangent, **kwargs)
 
 
 __version__ = "0.1.0"
